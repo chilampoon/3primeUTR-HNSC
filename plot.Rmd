@@ -1,0 +1,77 @@
+---
+title: "APA small playground"
+author: "Chi Lam Poon"
+date: "12/3/2019"
+output: html_document
+---
+
+See [pGeneWalk github](https://github.com/churchmanlab/genewalk)
+
+## Load
+```{R}
+gfold <- readRDS("~/APA/utr/gfold/gfold.res.rds")
+qapa.filt <- readRDS("~/APA/res.qapa/qapa.filt.res.rds")
+```
+
+
+### Heatmap
+```{R, fig.height=8, fig.width=7}
+library(pheatmap)
+
+ppas <- qapa.filt[grep("_P$", qapa.filt$APA_ID), ]
+ppas$ppau <- ppas$SRR5528014.PAU - ppas$SRR5528013.PAU
+
+esList=as.character(gfold[order(gfold$GFOLD, decreasing = T),]$GeneName[1:30])
+exprs <- gfold[,c('GeneSymbol', '1stRPKM', '2ndRPKM')]
+rownames(exprs) <- gfold$GeneName
+colnames(exprs) <- c('GeneSymbol', 'SRR5528013', 'SRR5528014')
+
+type.df <- data.frame(type=c('ctrl', 'drug'))
+rownames(type.df) <- c('SRR5528013', 'SRR5528014')
+type <- c("#54474e", "#abb8b1")
+names(type) <- c('ctrl', 'drug')
+anno_colors <- list(type = type)
+hm.gene <- as.character(exprs[esList,]$GeneSymbol)
+h <- pheatmap(exprs[esList, -1], annotation_col = type.df, annotation_colors = anno_colors,
+              labels_row = hm.gene, show_colnames = T)
+h
+
+```
+
+
+### Combined pathway barplot
+```{R, fig.height=14, fig.width=14}
+library(ggplot2)
+library(ggpubr)
+go.list <- readRDS('~/APA/utr/gfold/goseq.res.rds')
+
+drawPath <- function(wall, top.no, ccolor) {
+  df <- wall[,c("over_represented_pvalue", "term")]
+  df$logP <- -log10(df$over_represented_pvalue)
+  pdf <- df[1:top.no, ]
+  rownames(pdf) <- 1:nrow(pdf)
+  pdf$term <- factor(pdf$term, levels = pdf$term)
+  
+  ggplot(pdf, aes(x=term, y=logP)) +
+    geom_bar(stat = "identity", color="black", fill=ccolor) +
+    coord_flip() + scale_x_discrete(limits=rev(levels(pdf$term))) +
+    scale_y_continuous(limits = c(0, 10)) +
+    labs(y='-log10(P-val)', x='') +
+    theme_classic()
+}
+
+
+u <- drawPath(go.list[['uDEG']], 10, "tomato")
+d <- drawPath(go.list[['dDEG']], 10, "steelblue")
+s <- drawPath(go.list[['short']], 10, "skyblue")
+l <- drawPath(go.list[['long']], 10, "lightpink")
+su <- drawPath(go.list[['suDEG']], 10, "gold")
+
+ggarrange(u, d, s, l, su, ncol=2, nrow=3, legend='none', labels = c("A", "B", "C", "D", "E"))
+```
+
+
+
+
+
+

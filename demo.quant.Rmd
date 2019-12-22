@@ -1,0 +1,112 @@
+---
+title: "RNA-seq quantification: salmon + tximeta"
+author: "Chi Lam Poon"
+date: "11/12/2019"
+output: html_document
+---
+
+## Tools
+- Alignment-free quantification: `salmon`
+- Quantification import: `tximeta`
+- APA analysis: `QAPA`
+- Differential expression analysis: `DEseq2`
+
+HNSC data:
+
+1. SRR5528013 (DMSO)
+2. SRR5528014 (Aza/TSA)
+
+
+### Run salmon
+#### Prepare
+```{bash, eval=F}
+cd ~/APA/utr
+mkdir transcriptome
+cd transcriptome
+
+# down load reference transcriptome
+wget ftp://ftp.ensembl.org/pub/release-98/fasta/homo_sapiens/cdna/Homo_sapiens.GRCh38.cdna.all.fa.gz
+wget ftp://ftp.ensembl.org/pub/release-98/fasta/homo_sapiens/ncrna/Homo_sapiens.GRCh38.ncrna.fa.gz
+wget ftp://ftp.ensembl.org/pub/release-98/gtf/homo_sapiens/Homo_sapiens.GRCh38.98.gtf.gz
+
+# build index 
+salmon index -t Homo_sapiens.GRCh38.cdna.all.fa.gz Homo_sapiens.GRCh38.ncrna.fa.gz -i GRCh38.index
+```
+
+
+### Run mapping-based salmon
+./demo.quant.sh
+```{bash, eval=F}
+#!/bin/bash
+for fn in data/SRR55280{13..14};
+do
+samp=`basename ${fn}`
+echo "Processing sample ${samp}"
+salmon quant -i transcriptome/GRCh38.index/ -l A \
+             -r ${fn}.fastq \
+             -p 8 --validateMappings -o quants/${samp}
+done
+
+```
+
+
+### Import transcript-level quantifications using tximeta
+tximeta: transcript quantification import with automatic metadata
+
+See the [vignette](https://bioconductor.org/packages/release/bioc/vignettes/tximeta/inst/doc/tximeta.html).
+
+
+#### Start with sample table
+`tximeta` requires that the entire output directory of Salmon/Alevin
+```{R}
+suppressPackageStartupMessages(library(tximeta))
+# read in the sample table
+dir <- '/home/pclam/APA/utr'
+files <- c(file.path(dir, "quants", "SRR5528013", "quant.sf"), file.path(dir, "quants", "SRR5528014", "quant.sf"))
+coldata <- data.frame(files, names=c("SRR5528013", "SRR5528014"), condition=c("DMSO", "Aza/TSA"), stringsAsFactors=FALSE)
+coldata
+```
+
+
+#### Running tximeta from a sample table
+```{R}
+# I created a header.json file in the indexDir, see https://support.bioconductor.org/p/126276/
+indexDir <- file.path(dir, "transcriptome", "GRCh38.index")
+fastaPath <- c(file.path(dir, "data", "SRR5528013.fastq"),
+               file.path(dir, "data", "SRR5528014.fastq"))
+gtfPath <- file.path(dir, "transcriptome", "Homo_sapiens.GRCh38.98.gtf.gz")
+
+makeLinkedTxome(indexDir=indexDir,
+                source="Ensembl",
+                organism="Homo sapiens",
+                release="98",
+                genome="GRCh38",
+                fasta=fastaPath,
+                gtf=gtfPath,
+                write=FALSE)
+
+
+se <- tximeta(coldata, type = "salmon")
+```
+
+
+#### SummarizedExperiment output
+```{R}
+suppressPackageStartupMessages(library(SummarizedExperiment))
+colData(se)
+assayNames(se)
+rowRanges(se)
+seqinfo(se)
+
+# summarize into gene level
+gse <- summarizeToGene(se)
+rowRanges(gse)
+```
+
+
+### Save
+```{R}
+saveRDS(se, file=file.path(dir, "data/transcript.sum.rds"))
+saveRDS(gse, file=file.path(dir, "data/gene.sum.rds"))
+```
+

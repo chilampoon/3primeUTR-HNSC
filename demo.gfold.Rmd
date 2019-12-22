@@ -1,0 +1,112 @@
+---
+title: "GFOLD demo"
+author: "Chi Lam Poon"
+date: "11/24/2019"
+output: html_document
+---
+
+[__GFOLD: a generalized fold change for ranking differentially expressed genes from RNA-seq data__](https://academic.oup.com/bioinformatics/article/28/21/2782/235811)
+
+A technique for estimating fold change that takes into account the uncertainty of gene expression measurement by RNA-seq.
+The read counts are modeled by Possion distribution.
+GFOLD not only measures the fold change but also captures the small variance of the posterior distribution of log2 fold change for the highly expressed genes
+
+### Installation
+
+Follow the steps on [GFOLD bitbucket](https://bitbucket.org/feeldead/gfold/src/default/)
+
+### Prepare files for GFOLD
+
+Method to get exon lengths refers to this [biostar post](https://www.biostars.org/p/83901/).
+```{R}
+# load abundance estimation
+suppressPackageStartupMessages(library(SummarizedExperiment))
+gse <- readRDS('~/APA/utr/data/gene.sum.rds')
+gse
+expr <- as.data.frame(assay(gse))
+geneDF <- as.data.frame(rowRanges(gse))
+geneDF <- geneDF[ ,!colnames(geneDF) %in% c("entrezid", "seq_coord_system")]
+
+# get non-overlapped exon len
+suppressPackageStartupMessages(library(GenomicFeatures))
+txdb <- makeTxDbFromGFF('~/APA/utr/transcriptome/Homo_sapiens.GRCh38.98.gtf.gz')
+exonBygene <- exonsBy(txdb, by="gene")
+lengths <- data.frame(len=sum(width(reduce(exonBygene))))
+geneDF$elength <- lengths[match(rownames(geneDF), rownames(lengths)),]
+
+all(rownames(geneDF)==rownames(expr))
+read_cnt1 <- cbind(geneDF[,c("symbol", "gene_id")], expr$SRR5528013, geneDF$elength)
+read_cnt2 <- cbind(geneDF[,c("symbol", "gene_id")], expr$SRR5528014, geneDF$elength)
+
+colnames(read_cnt1) <- c("GeneSymbol", "GeneName", "Read Count", "Gene exon length") -> colnames(read_cnt2)
+
+countToFpkm <- function(counts, effLen) {
+  N <- sum(counts)
+  exp(log(counts) + log(1e9) - log(effLen) - log(N) )
+}
+
+read_cnt1$RPKM <- mapply(countToFpkm, read_cnt1[['Read Count']], read_cnt1[['Gene exon length']])
+read_cnt2$RPKM <- mapply(countToFpkm, read_cnt2[['Read Count']], read_cnt2[['Gene exon length']])
+read_cnt1$RPKM <- gsub('NaN', 0, read_cnt1$RPKM)
+read_cnt2$RPKM <- gsub('NaN', 0, read_cnt2$RPKM)
+
+head(read_cnt1); head(read_cnt2)
+
+# save
+write.table(read_cnt1, file='~/APA/utr/gfold/SRR5528013.read_cnt', quote = F, sep = "\t", row.names = F)
+write.table(read_cnt2, file='~/APA/utr/gfold/SRR5528014.read_cnt', quote = F, sep = "\t", row.names = F)
+```
+
+
+### Analyze the result
+The __GFOLD__ value could be considered as a reliable log2 fold change. It is positive/negative if the gene is up/down regulated. The main usefulness of GFOLD is to provide a biological meanlingful ranking of the genes. The GFOLD value is zero if the gene doesn't show differential expression. 
+
+```{R}
+gfold <- read.delim(file='~/APA/utr/gfold/final.diff.txt', comment.char = '#')
+colnames(gfold) <- c("GeneSymbol", "GeneName", "GFOLD", "E-FDR", "log2fdc", "1stRPKM", "2ndRPKM")
+saveRDS(gfold, file='~/APA/utr/gfold/gfold.res.rds')
+head(gfold)
+
+## up-regulated/down-regulate/non-DE genes
+nrow(gfold[gfold$GFOLD > 0,]); nrow(gfold[gfold$GFOLD < 0,]); nrow(gfold[gfold$GFOLD == 0,])
+
+# sort the top up-/down-regulated genes
+head(gfold[order(gfold$GFOLD, decreasing = T),], 20)
+head(gfold[order(gfold$GFOLD, decreasing = F),], 20)
+```
+
+#### Distribution of the measures
+```{R}
+library(ggplot2)
+
+# GFOLD
+ggplot(gfold, aes(x=GFOLD)) + 
+  geom_density() +
+  theme_classic()
+
+# logFC
+ggplot(gfold, aes(x=log2fdc)) + 
+  geom_density() +
+  theme_classic()
+
+## manual MA plot
+ma.df1 <- data.frame(log2fc = gfold$log2fdc, meanCnt = log2(sqrt(gfold[,'1stRPKM'] * gfold[,'2ndRPKM'])))
+ma.df2 <- data.frame(log2fc = gfold$log2fdc, meanCnt = 0.5 * (log2(gfold[,'1stRPKM'] + 1) + log2(gfold[,'2ndRPKM'] + 1)))
+ma.df1 <- ma.df1[ma.df1$meanCnt != -Inf,]
+
+ggplot(ma.df1, aes(x=meanCnt, y=log2fc)) +
+  geom_point(alpha=0.3, size=1.8) +
+  geom_hline(aes(yintercept=0), size=0.6) +
+  labs(title="log2 RPKM") +
+  theme_classic()
+
+ggplot(ma.df2, aes(x=meanCnt, y=log2fc)) +
+  geom_point(alpha=0.3, size=1.8) +
+  geom_hline(aes(yintercept=0), size=0.6) +
+  labs(title="(log2 + 1) RPKM") +
+  theme_classic()
+
+```
+
+
+

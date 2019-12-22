@@ -1,0 +1,349 @@
+---
+title: "QAPA + goseq demo"
+author: "Chi Lam Poon"
+date: "11/22/2019"
+output: html_document
+---
+
+### Materials
+
+QAPA: RNA-seq Quantification of Alternative Polyadenylation
+
+See their [github](https://github.com/morrislab/qapa) and follow their instruction step by step.
+
+
+HNSC data:
+
+1. SRR5528013 (DMSO)
+2. SRR5528014 (Aza/TSA)
+
+> Note that the latest version of Salmon (v1.0.0) has bug for 3'UTR fasta indexing, therefore remember to use Salmon v0.15 for this step before they fix it!
+
+### Prepare QAPA
+#### Retrive gene annotation from biomart
+```{R, eval=F}
+library("biomaRt")
+ensembl <- useMart("ensembl", dataset="hsapiens_gene_ensembl")
+geneList <- getBM(mart=ensembl,
+                  attributes=c("ensembl_gene_id", 
+                               "ensembl_transcript_id",
+                               "gene_biotype",
+                               "transcript_biotype",
+                               "external_gene_name"))
+
+colnames(geneList) <- c("Gene stable ID", "Transcript stable ID", "Gene type", "Transcript type", "Gene name")
+write.table(geneList, file="~/APA/qapa/ensembl_identifiers.txt", quote = F, row.names = F, sep = "\t")
+```
+
+
+```{bash, eval=F}
+conda install salmon=0.15
+qapa fasta -f ../utr/genome/hg38/hg38.fa ../qapa/qapa_3utrs.gencode_V31.hg38.bed output_sequences.fa
+salmon index -t output_sequences.fa -i utr_index
+./utr.quant.sh
+qapa quant --db ../qapa/ensembl_identifiers.txt quants/SRR*/quant.sf > pau.results.txt
+```
+
+`utr.quant.sh`:
+```{bash, eval=F}
+#!/bin/bash
+
+echo "Quantifying UTR isoform expression..."
+for fn in ~/APA/utr/data/SRR55280{13..14};
+do
+  samp=`basename ${fn}`
+  echo "Processing sample ${samp}"
+  salmon quant -i utr_library/ -l A -r ${fn}.fastq -p 8 --validateMappings -o quants/${samp}
+done
+```
+
+
+### Get results
+```{R}
+pau.res <- read.delim(file = '~/APA/res.qapa/pau.results.txt', header = T)
+head(pau.res)
+nrow(pau.res)
+```
+
+
+### Analyze QAPA results
+
+#### Filtering
+
+1. Keep 3'UTR that had a total gene expression of at least 3 TPM for both samples __(should be aggregate to gene-level first...)__
+2. Exclude gene pairs whose distal 3'UTRs had 3' ends that were within 500 nt of each other
+3. Exclude genes with a aUTR lengths of less than 100 nt to reduce potentially noisy estimates
+
+
+```{R}
+# 1. filt by TPM > 3 (improve later)
+tpm.header <- grep("TPM", colnames(pau.res))
+pau.res$total.tpm <- apply(pau.res[ ,tpm.header], 1, sum)
+
+gene.split <- split(pau.res$total.tpm, as.character(pau.res$Gene))
+keep.list <- gene.split[lapply(gene.split, sum) > 3]
+length(keep.list)
+filt.res <- pau.res[pau.res$Gene %in% names(keep.list), ]
+filt.res <- filt.res[,-ncol(filt.res)]
+nrow(filt.res)
+
+# 2. filt by 3'end position
+suppressPackageStartupMessages(library(doParallel))
+registerDoParallel()
+
+filt.res <- filt.res[order(filt.res$Gene),]
+distal.df <- filt.res[grep("_D$", filt.res$APA_ID),]
+dis.gene <- unique(as.character(distal.df$Gene))
+distal.end <- foreach(gene=dis.gene, .combine = c) %dopar% {
+  trsc <- distal.df[distal.df$Gene == gene,]
+  strand <- as.character(unique(trsc$Strand))
+  if (strand == "+") {
+    maxD <- trsc$UTR3.End
+  } else {
+    maxD <- trsc$UTR3.Start
+  }
+  maxD
+}
+
+end.df <- data.frame(id=distal.df$Gene, end=distal.end)
+end.df$id <- as.character(end.df$id)
+
+throw.id <- foreach(g=1:(length(dis.gene)-1), .combine = c) %dopar% {
+  gene <- dis.gene[g]
+  range <- c()
+  for (i in end.df[end.df$id==gene, ]$end) {
+    range <- c(range, seq(i-500, i+500, by=1))
+  }
+  # sweep the window
+  trap <- foreach(k=(g+1):length(dis.gene), .combine = c) %do% {
+    if (any(end.df[end.df$id==dis.gene[k], ]$end %in% range)) dis.gene[k]
+  }
+  if (is.null(trap)) {
+    final <- c()
+  } else {
+    final <- c(gene, trap)
+  }
+  final
+}
+
+length(throw.id)
+filt.res2 <- filt.res[!filt.res$Gene %in% throw.id, ]
+nrow(filt.res2)
+
+# 3. filt by aUTR length
+# aUTR = farthest dPAS - pPAS 
+#      = max(UTR length) - min(UTR length)
+
+utr.split <- split(filt.res2$Length, as.character(filt.res2$Gene))
+deltaUTR <- function(vec) {
+  max(vec) - min(vec)
+}
+long.utr <- utr.split[lapply(utr.split, deltaUTR) > 100]
+filt.res3 <- filt.res2[filt.res2$Gene %in% names(long.utr), ]
+nrow(filt.res3)
+
+## save filtered QAPA result
+saveRDS(filt.res3, file='~/APA/res.qapa/qapa.filt.res.rds')
+#filt.res3=readRDS('~/APA/res.qapa/qapa.filt.res.rds')
+```
+
+#### Calculate PPAU
+
+delta PPAU: change in pPAS usage, if replicates, use median
+
+However actually many changes happened in various distal PAS, so...?
+
+__delta PPAU = ctrl PAU - case PAU__
+
+- lengthening: delta PPAU > 20
+- no change: delta PPAU %in% -20 ~ 20
+- shortening: delta PPAU < -20
+
+```{R}
+ppas <- filt.res3[grep("_P$", filt.res3$APA_ID), ]
+# delta PPAU = ctrl PAU - case PAU
+ppas$ppau <- ppas$SRR5528014.PAU - ppas$SRR5528013.PAU
+
+type.list <- list()
+type.list[['shortening']] <- filt.res3[filt.res3$Gene %in% as.character(ppas[ppas$ppau <= -20, ]$Gene),]
+type.list[['noChange']] <- filt.res3[filt.res3$Gene %in% as.character(ppas[ppas$ppau > -20 & ppas$ppau < 20, ]$Gene),]
+type.list[['lengthening']] <- filt.res3[filt.res3$Gene %in% as.character(ppas[ppas$ppau >= 20, ]$Gene),]
+
+# bar plot
+ppau.sum <- data.frame(cnt = as.integer(lapply(type.list, function(x) length(unique(x$Gene)))),
+                       type = names(type.list))
+  
+suppressPackageStartupMessages(library(ggplot2))
+
+ggplot(ppau.sum, aes(x=type, y=cnt, fill=type)) + 
+  geom_bar(stat = "identity", color="black") +
+  scale_y_continuous(limits=c(0,4700), expand = c(0.02,0)) +
+  geom_text(aes(type, cnt, label = cnt), size=5, vjust=-0.3, hjust=0.5) +
+  scale_fill_brewer(palette='Dark2') +
+  labs(x="", y="") +
+  theme_classic() 
+
+
+# violin plot
+autr.df <- data.frame()
+for (type in names(type.list)) {
+  df <- type.list[[type]]
+  tmp <- split(df$Length, as.character(df$Gene))
+  aUTR <- data.frame(length=sapply(tmp, deltaUTR))
+  aUTR$type <- type
+  autr.df <- rbind(autr.df, aUTR)
+}
+autr.df$length <- autr.df$length/1000
+
+ggplot(autr.df, aes(x=type, y=length, fill=type)) + 
+  geom_violin(color="black") +
+  geom_boxplot(width=0.1) +
+  scale_fill_brewer(palette='Dark2') +
+  labs(x="", y="aUTR length (kb)") +
+  theme_classic()
+```
+
+#### Density
+```{R, fig.width=12, fid.height=6}
+par(mfrow=c(1 ,3))
+plot(density(autr.df[autr.df$type=="lengthening",]$length), main='lengthening', ylim=c(0,0.4), xlim=c(0,15))
+plot(density(autr.df[autr.df$type=="noChange",]$length), main='noChange', ylim=c(0,0.4), xlim=c(0,15))
+plot(density(autr.df[autr.df$type=="shortening",]$length), main='shortening', ylim=c(0,0.4), xlim=c(0,15))
+```
+
+```{R}
+ks.test(autr.df[autr.df$type=="lengthening",]$length, autr.df[autr.df$type=="noChange",]$length)
+ks.test(autr.df[autr.df$type=="lengthening",]$length, autr.df[autr.df$type=="shortening",]$length)
+ks.test(autr.df[autr.df$type=="shortening",]$length, autr.df[autr.df$type=="noChange",]$length)
+
+print(unique(as.character(type.list[['lengthening']]$Gene_Name))[1:20])
+print(unique(as.character(type.list[['shortening']]$Gene_Name))[1:20])
+```
+
+#### Combind gene log fold change
+```{R}
+gfold <- readRDS(file='~/APA/utr/gfold/gfold.res.rds')
+colnames(gfold)[2] <- "Gene"
+
+ppau.gf <- merge(ppas[,c('Gene', 'Gene_Name', 'ppau')], gfold[,c('Gene', 'GFOLD')], by='Gene')
+
+nrow(ppau.gf[ppau.gf$ppau<= -20 & ppau.gf$GFOLD >= 0.5,])
+nrow(ppau.gf[ppau.gf$ppau>= 20 & ppau.gf$GFOLD >= 0.5,])
+
+# Scatter plot
+line.df <- data.frame(v=c(-20, 20), h=c(-0.5, 0.5))
+
+ggplot(ppau.gf, aes(x=ppau, y=GFOLD)) + 
+  geom_point(alpha=0.3, colour="steelblue") +
+  geom_vline(aes(xintercept=v), line.df, lty=2, size=1, alpha=0.6) +
+  geom_hline(aes(yintercept=h), line.df, lty=2, size=1, alpha=0.6) +
+  theme_classic()
+```
+
+
+### Pathway analysis using goseq
+
+```{R}
+suppressPackageStartupMessages({
+  library(goseq)
+  library(GenomicFeatures)
+})
+# Conduct GOSeq
+#head(supportedGenomes())
+#pwf <- nullp(gene.reg, "hg38", "ensGene") #???
+
+# delete duplicates & na in ppau.gf
+ppau.gf <- ppau.gf[order(ppau.gf$Gene, -abs(ppau.gf$ppau), -abs(ppau.gf$GFOLD)),]
+ppau.gf <- ppau.gf[!duplicated(ppau.gf$Gene),] #delete 15 rows
+ppau.gf <- ppau.gf[!is.na(ppau.gf$ppau),] #delete 5 rows
+ppau.gf$Gene <- factor(ppau.gf$Gene)
+ppau.gf$Gene_Name <- factor(ppau.gf$Gene_Name)
+
+# get gene length data by myself and mannualy provide to goseq
+txdb <- makeTxDbFromGFF('~/APA/utr/transcriptome/Homo_sapiens.GRCh38.98.gtf.gz')
+exonBygene <- exonsBy(txdb, by="gene")
+lengths <- sum(width(reduce(exonBygene)))
+lengthsFilt <- lengths[names(lengths) %in% ppau.gf$Gene] # here I just annalyze the intersected genes of ppas & gfold
+
+
+# goseq for different genes
+getGOwall <- function(vec) {
+  # function to get the gene lists of "numDFinCat" in GO.wall report
+  getGeneLists <- function(pwf, goterms, genome, ids){
+    gene2cat <- getgo(rownames(pwf), genome, ids)
+    cat2gene <- split(rep(names(gene2cat), sapply(gene2cat, length)),
+                      unlist(gene2cat, use.names = FALSE))
+    out <- list()
+    for(term in goterms){
+      tmp <- pwf[cat2gene[[term]],]
+      tmp <- rownames(tmp[tmp$DEgenes > 0, ])
+      out[[term]] <- tmp
+    }
+    out
+  }
+  
+  names(vec) <- ppau.gf$Gene
+  print(table(vec))
+  
+  # goseq for GOBP
+  suppressWarnings(pwf <- nullp(vec, "hg38", "ensGene", bias.data = lengthsFilt))
+  GO.wall <- goseq(pwf, "hg38", "ensGene", test.cats = "GO:BP")
+  go.list <- getGeneLists(pwf, GO.wall$category, "hg38", "ensGene")
+  symbol.list <- lapply(go.list, function(x) as.character(ppau.gf[ppau.gf$Gene %in% x,]$Gene_Name))
+  GO.wall$symbol <- sapply(GO.wall$category, function(x) paste0(symbol.list[[x]], collapse = ","))
+  GO.wall
+}
+
+
+# up-regulated DEGs
+uDEG.wall <- getGOwall(as.integer(ppau.gf$GFOLD > 0.1))
+
+# down-regulated DEGs
+dDEG.wall <- getGOwall(as.integer(ppau.gf$GFOLD < -0.1))
+
+# shortening genes
+short.wall <- getGOwall(as.integer(ppau.gf$ppau < -20))
+
+# lengthening genes
+long.wall <- getGOwall(as.integer(ppau.gf$ppau > 20))
+
+# shortening & up-regulated 
+suDEG.wall <- getGOwall(as.integer(ppau.gf$GFOLD > 0.1 & ppau.gf$ppau < -20))
+
+head(suDEG.wall, 2)
+
+# save goseq results
+goseq.res <- list()
+for (name in c('uDEG', 'dDEG', 'short', 'long', 'suDEG')) {
+  goseq.res[[name]] <- get(paste0(name, '.wall'))
+}
+saveRDS(goseq.res, file='~/APA/utr/gfold/goseq.res.rds')
+```
+
+
+#### Visualize enriched pathways
+```{R}
+drawPath <- function(wall, top.no, ccolor) {
+  df <- wall[,c("over_represented_pvalue", "term")]
+  df$logP <- -log10(df$over_represented_pvalue)
+  pdf <- df[1:top.no, ]
+  rownames(pdf) <- 1:nrow(pdf)
+  pdf$term <- factor(pdf$term, levels = pdf$term)
+  
+  ggplot(pdf, aes(x=term, y=logP)) +
+    geom_bar(stat = "identity", color="black", fill=ccolor) +
+    coord_flip() + scale_x_discrete(limits=rev(levels(pdf$term))) +
+    labs(y='-log10(P-val)', x='GOBP term') +
+    theme_classic()
+}
+
+drawPath(uDEG.wall, 20, "tomato")
+drawPath(dDEG.wall, 20, "steelblue")
+drawPath(short.wall, 20, "skyblue")
+drawPath(long.wall, 20, "lightpink")
+drawPath(suDEG.wall, 20, "gold")
+```
+
+
+
+
