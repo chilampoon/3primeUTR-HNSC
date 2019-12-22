@@ -10,3 +10,5 @@ Here we aim to characterize the landscape of 3'UTR in ER-stressed heck and neck 
 <p align="center">
     <img src="fig1.png" width="400" alt="workflow"/>
 </p>
+
+Have a glance at my [report](https://github.com/chilampoon/3primeUTR-HNSC/blob/master/APA_workflow_chilam.pdf).
